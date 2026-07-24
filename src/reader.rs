@@ -1,16 +1,17 @@
 use anyhow::{Error, Result, anyhow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::SchemaRef;
-use bytes::Bytes;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use orc_rust::arrow_reader::ArrowReaderBuilder;
 use orc_rust::projection::ProjectionMask as OrcProjectionMask;
 use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
-use parquet::file::reader::{ChunkReader as ParquetChunkReader, FileReader, SerializedFileReader};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use snap::read::FrameDecoder as SnappyDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tempfile::NamedTempFile;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +80,14 @@ pub fn get_file_type(file_path: &str) -> Result<FileType> {
 
 /// Where batches are read from.
 ///
-/// Uncompressed files stay on disk and are opened lazily per reader, so data
-/// is only decoded as batches are consumed. Compressed files must be fully
-/// decompressed up front (Parquet/ORC readers need random access), but the
-/// decompressed buffer is shared cheaply between readers via `Bytes`.
+/// Uncompressed files are opened in place. Compressed files are streamed
+/// through the decoder into a temporary file once (constant memory), and all
+/// readers then get random access to that file; it is deleted when the last
+/// `DataSource` clone drops.
 #[derive(Clone)]
 pub enum DataSource {
     File(PathBuf),
-    Memory(Bytes),
+    Decompressed(Arc<NamedTempFile>),
 }
 
 impl DataSource {
@@ -102,7 +103,7 @@ impl DataSource {
         }
 
         let file = BufReader::new(File::open(path).map_err(Error::new)?);
-        let mut reader: Box<dyn Read> = match compression {
+        let mut decoder: Box<dyn Read> = match compression {
             CompressionType::None => unreachable!(),
             CompressionType::Gzip => Box::new(GzDecoder::new(file)),
             CompressionType::Zlib => Box::new(ZlibDecoder::new(file)),
@@ -110,9 +111,17 @@ impl DataSource {
             CompressionType::Zstd => Box::new(ZstdDecoder::new(file).map_err(Error::new)?),
         };
 
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).map_err(Error::new)?;
-        Ok(DataSource::Memory(Bytes::from(buffer)))
+        let mut temp = NamedTempFile::new().map_err(Error::new)?;
+        std::io::copy(&mut decoder, temp.as_file_mut()).map_err(Error::new)?;
+        Ok(DataSource::Decompressed(Arc::new(temp)))
+    }
+
+    /// Open a fresh read handle; can be called repeatedly (e.g. once per scan).
+    fn reader_file(&self) -> Result<File> {
+        match self {
+            DataSource::File(path) => File::open(path).map_err(Error::new),
+            DataSource::Decompressed(temp) => temp.reopen().map_err(Error::new),
+        }
     }
 }
 
@@ -125,25 +134,15 @@ pub fn open_batch_reader(
     file_type: FileType,
     columns: Option<&[String]>,
 ) -> Result<BatchReader> {
-    match (file_type, source) {
-        (FileType::Parquet, DataSource::File(path)) => {
-            open_parquet_reader(File::open(path).map_err(Error::new)?, columns)
-        }
-        (FileType::Parquet, DataSource::Memory(bytes)) => {
-            open_parquet_reader(bytes.clone(), columns)
-        }
-        (FileType::Orc, DataSource::File(path)) => {
-            open_orc_reader(File::open(path).map_err(Error::new)?, columns)
-        }
-        (FileType::Orc, DataSource::Memory(bytes)) => open_orc_reader(bytes.clone(), columns),
+    let file = source.reader_file()?;
+    match file_type {
+        FileType::Parquet => open_parquet_reader(file, columns),
+        FileType::Orc => open_orc_reader(file, columns),
     }
 }
 
-fn open_parquet_reader<R>(input: R, columns: Option<&[String]>) -> Result<BatchReader>
-where
-    R: ParquetChunkReader + Send + 'static,
-{
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(input).map_err(Error::new)?;
+fn open_parquet_reader(file: File, columns: Option<&[String]>) -> Result<BatchReader> {
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(Error::new)?;
 
     if let Some(column_names) = columns {
         let indices = column_indices(&builder.schema().clone(), column_names)?;
@@ -154,11 +153,8 @@ where
     Ok(Box::new(builder.build().map_err(Error::new)?))
 }
 
-fn open_orc_reader<R>(input: R, columns: Option<&[String]>) -> Result<BatchReader>
-where
-    R: orc_rust::reader::ChunkReader + Send + 'static,
-{
-    let builder = ArrowReaderBuilder::try_new(input).map_err(Error::new)?;
+fn open_orc_reader(file: File, columns: Option<&[String]>) -> Result<BatchReader> {
+    let builder = ArrowReaderBuilder::try_new(file).map_err(Error::new)?;
 
     let builder = if let Some(column_names) = columns {
         column_indices(&builder.schema(), column_names)?; // validate names
@@ -198,10 +194,11 @@ pub fn get_raw_schema_string(file_path: &str) -> Result<String> {
     let source = DataSource::open(file_path)?;
 
     match file_type {
-        FileType::Parquet => match &source {
-            DataSource::File(path) => raw_parquet_schema(File::open(path).map_err(Error::new)?),
-            DataSource::Memory(bytes) => raw_parquet_schema(bytes.clone()),
-        },
+        FileType::Parquet => {
+            let reader = SerializedFileReader::new(source.reader_file()?).map_err(Error::new)?;
+            let schema = reader.metadata().file_metadata().schema();
+            Ok(format!("{:#?}", schema))
+        }
         FileType::Orc => Ok(format!(
             "{:#?}",
             open_batch_reader(&source, file_type, None)?.schema()
@@ -209,21 +206,9 @@ pub fn get_raw_schema_string(file_path: &str) -> Result<String> {
     }
 }
 
-fn raw_parquet_schema<R: ParquetChunkReader + 'static>(input: R) -> Result<String> {
-    let reader = SerializedFileReader::new(input).map_err(Error::new)?;
-    let schema = reader.metadata().file_metadata().schema();
-    Ok(format!("{:#?}", schema))
-}
-
 pub fn get_parquet_metadata(file_path: &str) -> Result<()> {
-    match DataSource::open(file_path)? {
-        DataSource::File(path) => print_parquet_metadata(File::open(path).map_err(Error::new)?),
-        DataSource::Memory(bytes) => print_parquet_metadata(bytes),
-    }
-}
-
-fn print_parquet_metadata<R: ParquetChunkReader + 'static>(input: R) -> Result<()> {
-    let reader = SerializedFileReader::new(input).map_err(Error::new)?;
+    let source = DataSource::open(file_path)?;
+    let reader = SerializedFileReader::new(source.reader_file()?).map_err(Error::new)?;
     let metadata = reader.metadata();
     let file_metadata = metadata.file_metadata();
 
@@ -244,14 +229,8 @@ fn print_parquet_metadata<R: ParquetChunkReader + 'static>(input: R) -> Result<(
 }
 
 pub fn get_orc_metadata(file_path: &str) -> Result<()> {
-    match DataSource::open(file_path)? {
-        DataSource::File(path) => print_orc_metadata(File::open(path).map_err(Error::new)?),
-        DataSource::Memory(bytes) => print_orc_metadata(bytes),
-    }
-}
-
-fn print_orc_metadata<R: orc_rust::reader::ChunkReader>(input: R) -> Result<()> {
-    let reader_builder = ArrowReaderBuilder::try_new(input).map_err(Error::new)?;
+    let source = DataSource::open(file_path)?;
+    let reader_builder = ArrowReaderBuilder::try_new(source.reader_file()?).map_err(Error::new)?;
     let metadata = reader_builder.file_metadata();
 
     println!("Number of rows: {}", metadata.number_of_rows());

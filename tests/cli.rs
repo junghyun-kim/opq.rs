@@ -37,6 +37,9 @@ fn fixture_dir() -> &'static Path {
         if !dir.join("big_sort.orc").exists() {
             write_big_sort_fixture(&dir.join("big_sort.orc"));
         }
+        if !dir.join("big_sort.orc.gz").exists() {
+            gzip_file(&dir.join("big_sort.orc"), &dir.join("big_sort.orc.gz"));
+        }
         dir
     })
 }
@@ -541,6 +544,28 @@ fn full_sort_larger_than_memory_limit_spills_and_completes() {
         values.windows(2).all(|w| w[0] <= w[1]),
         "output must be globally sorted"
     );
+}
+
+#[test]
+fn compressed_full_sort_with_memory_limit_completes() {
+    // Compressed input is decompressed to a temporary file, so the memory
+    // budget only has to cover the sort itself.
+    let out = opq_ok(&[
+        "view",
+        &fixture("big_sort.orc.gz"),
+        "--sort",
+        "value",
+        "--limit",
+        "0",
+        "--memory-limit",
+        "64M",
+        "--format",
+        "ndjson",
+    ]);
+    let values = ndjson_field(&out, "value");
+    assert_eq!(values.len(), BIG_SORT_ROWS as usize);
+    assert_eq!(values[0], 0);
+    assert_eq!(*values.last().unwrap(), BIG_SORT_ROWS - 1);
 }
 
 #[test]

@@ -350,10 +350,10 @@ OPQ.RS is designed to handle large files efficiently:
 - **Memory usage** - Constant memory usage regardless of file size
 - **5GB+ files** - No memory issues, processes in batches
 
-#### ⚠️ **Compressed Files (Memory considerations)**
-- **Memory requirement** - Decompressed file size + processing overhead
-- **5GB compressed file** - May require 6-8GB available memory
-- **Recommendation** - For very large files, use uncompressed format when possible
+#### ✅ **Compressed Files**
+- **Streaming decompression** - Compressed inputs are streamed into a temporary file (constant memory), then read with random access
+- **Disk requirement** - Needs free space for the decompressed copy in the system temp directory (respects `TMPDIR`)
+- **Memory usage** - Stays flat regardless of the compressed file's size
 
 #### 💡 **Best Practices for Large Files**
 ```bash
@@ -374,6 +374,14 @@ opq view huge_file.parquet --limit 1000 --format ndjson > sample.jsonl
 
 - Rust 1.89.0 or later
 - macOS, Linux, or Windows
+
+## Roadmap
+
+- `opq convert` — convert ORC (and compressed inputs) to Parquet, bridging tools without ORC support (e.g. DuckDB)
+- Extended `metadata` statistics — row group / stripe details, per-column min/max/null counts, compression codecs
+- Multiple file support for `view`
+- Magic-byte file type detection (extension-independent)
+- Nested field selection (`address.city`)
 
 ## Contributing
 
@@ -402,6 +410,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **New**: Sort columns no longer need to be included in `--columns`
 - **Changed**: All sorting paths unified into a single DataFusion pipeline; with `--limit` the sort executes as a streaming TopK
 - **Changed**: ORC reading is now lazy/streaming instead of loading the whole file up front
+- **Changed**: Compressed inputs are streamed to a temporary file instead of being buffered in memory, so memory usage no longer scales with the decompressed size
 - **Removed**: Dead `main_new.rs` and unused vertical-format code
 - **Added**: End-to-end CLI test suite covering sorting, compression, formatting, and limits
 

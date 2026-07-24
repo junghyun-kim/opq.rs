@@ -2179,7 +2179,6 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
- "bytes",
  "clap",
  "comfy-table",
  "datafusion",
@@ -2189,6 +2188,7 @@ dependencies = [
  "parquet",
  "serde_json",
  "snap",
+ "tempfile",
  "tokio",
  "zstd",
 ]
