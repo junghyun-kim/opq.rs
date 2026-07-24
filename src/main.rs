@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod metadata;
 mod output;
 mod reader;
 mod schema;

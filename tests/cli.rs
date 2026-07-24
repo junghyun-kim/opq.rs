@@ -701,3 +701,50 @@ fn metadata_shows_row_count() {
     let out = opq_ok(&["metadata", &fixture("test.orc")]);
     assert!(out.contains("Number of rows: 120000"), "got: {}", out);
 }
+
+#[test]
+fn parquet_metadata_shows_column_statistics() {
+    let out = opq_ok(&["metadata", &fixture("test.parquet")]);
+    // Per-row-group summary with sizes.
+    assert!(out.contains("Row group #0"), "got: {}", out);
+    // Column stats from the footer: value ranges 0..=2999, no nulls.
+    assert!(out.contains("2999"), "value max missing: {}", out);
+    assert!(out.contains("홍길동_0000"), "name min missing: {}", out);
+    assert!(out.contains("홍길동_2999"), "name max missing: {}", out);
+    // Date column stats render as dates (19000 days = 2022-01-08).
+    assert!(out.contains("2022-01-08"), "date min missing: {}", out);
+    assert!(out.contains("2022-04-17"), "date max missing: {}", out);
+    // Compression codec per column (ArrowWriter default).
+    assert!(out.contains("UNCOMPRESSED"), "codec missing: {}", out);
+}
+
+#[test]
+fn orc_metadata_shows_stripes_and_columns() {
+    // The orc-rust writer used for fixtures doesn't emit column statistics
+    // (upstream TODO), so this checks structure and graceful "-" fallbacks.
+    let out = opq_ok(&["metadata", &fixture("test.orc")]);
+    assert!(out.contains("Stripe #0"), "stripes missing: {}", out);
+    assert!(out.contains("Compression: None"), "compression missing: {}", out);
+    assert!(out.contains("value"), "column name missing: {}", out);
+    assert!(out.contains("INT64"), "column type missing: {}", out);
+}
+
+#[test]
+fn orc_metadata_shows_real_file_column_statistics() {
+    // Apache ORC's canonical example file, written by the Java writer with
+    // full column statistics in the footer.
+    let out = opq_ok(&["metadata", "tests/data/TestOrcFile.test1.orc"]);
+    assert!(out.contains("Zlib"), "compression missing: {}", out);
+    assert!(out.contains("Stripe #0"), "stripes missing: {}", out);
+    // string1 min/max
+    assert!(out.contains("bye"), "string min missing: {}", out);
+    assert!(out.contains("hi"), "string max missing: {}", out);
+    // long1 max = i64::MAX
+    assert!(
+        out.contains("9223372036854775807"),
+        "long max missing: {}",
+        out
+    );
+    // Nested columns degrade gracefully.
+    assert!(out.contains("STRUCT"), "struct column missing: {}", out);
+}

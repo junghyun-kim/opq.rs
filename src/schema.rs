@@ -93,7 +93,7 @@ fn print_arrow_field_recursive(
     }
 }
 
-fn format_arrow_data_type(data_type: &DataType) -> String {
+pub(crate) fn format_arrow_data_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Null => "NULL".to_string(),
         DataType::Boolean => "BOOLEAN".to_string(),

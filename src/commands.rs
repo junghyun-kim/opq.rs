@@ -1,8 +1,9 @@
 use crate::cli::{OutputFormat, SchemaFormat};
+use crate::metadata::print_metadata;
 use crate::output::{RowBudget, print_batches, render_table, write_ndjson_batch};
 use crate::reader::{
     CompressionType, DataSource, FileType, detect_compression_from_extension, get_file_type,
-    get_orc_metadata, get_parquet_metadata, open_batch_reader,
+    open_batch_reader,
 };
 use crate::schema::show_schema;
 use crate::sort::{SortSpec, parse_sort_specs};
@@ -32,11 +33,7 @@ pub fn handle_schema_command(files: &[String], format: &SchemaFormat) -> Result<
 pub fn handle_metadata_command(files: &[String]) -> Result<()> {
     for file in files {
         println!("=== {} ===", file);
-        let file_type = get_file_type(file)?;
-        match file_type {
-            FileType::Parquet => get_parquet_metadata(file)?,
-            FileType::Orc => get_orc_metadata(file)?,
-        };
+        print_metadata(file)?;
         println!(); // 파일 간 구분을 위한 빈 줄
     }
     Ok(())

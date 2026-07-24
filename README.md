@@ -22,7 +22,7 @@ Note: Vertical format has been removed. Use table format for structured output o
 
 ### Commands
 - **schema** - View file schema and structure with tree visualization support
-- **metadata** - View file metadata and statistics 
+- **metadata** - View file metadata and footer statistics: row group / stripe breakdown with sizes and compression ratios, and per-column type, codec, null count, and min/max — read from the footer only, so it's instant even on multi-GB files
 - **view** - View file contents with filtering, sorting, column selection, and customizable output formats
 
 ### Advanced Features
@@ -378,7 +378,6 @@ opq view huge_file.parquet --limit 1000 --format ndjson > sample.jsonl
 ## Roadmap
 
 - `opq convert` — convert ORC (and compressed inputs) to Parquet, bridging tools without ORC support (e.g. DuckDB)
-- Extended `metadata` statistics — row group / stripe details, per-column min/max/null counts, compression codecs
 - Multiple file support for `view`
 - Magic-byte file type detection (extension-independent)
 - Nested field selection (`address.city`)
@@ -407,6 +406,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **Fixed**: Build failure caused by two incompatible arrow versions being resolved; `Cargo.lock` is now committed for reproducible builds
 - **New**: `--limit 0` displays all rows
 - **New**: `--memory-limit` (default `1G`) — full sorts larger than the budget automatically spill to temporary disk files (true external sort); smaller sorts stay in memory
+- **New**: `metadata` shows footer statistics — file size, row group / stripe breakdown with compression ratios, and per-column type, codec, null count, and min/max (dates formatted; nested types degrade gracefully)
 - **New**: Sort columns no longer need to be included in `--columns`
 - **Changed**: All sorting paths unified into a single DataFusion pipeline; with `--limit` the sort executes as a streaming TopK
 - **Changed**: ORC reading is now lazy/streaming instead of loading the whole file up front

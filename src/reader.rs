@@ -117,7 +117,7 @@ impl DataSource {
     }
 
     /// Open a fresh read handle; can be called repeatedly (e.g. once per scan).
-    fn reader_file(&self) -> Result<File> {
+    pub(crate) fn reader_file(&self) -> Result<File> {
         match self {
             DataSource::File(path) => File::open(path).map_err(Error::new),
             DataSource::Decompressed(temp) => temp.reopen().map_err(Error::new),
@@ -206,40 +206,3 @@ pub fn get_raw_schema_string(file_path: &str) -> Result<String> {
     }
 }
 
-pub fn get_parquet_metadata(file_path: &str) -> Result<()> {
-    let source = DataSource::open(file_path)?;
-    let reader = SerializedFileReader::new(source.reader_file()?).map_err(Error::new)?;
-    let metadata = reader.metadata();
-    let file_metadata = metadata.file_metadata();
-
-    println!("Number of row groups: {}", metadata.num_row_groups());
-    println!("Number of rows: {}", file_metadata.num_rows());
-    println!(
-        "Created by: {}",
-        file_metadata.created_by().unwrap_or("N/A")
-    );
-
-    if let Some(key_value_metadata) = file_metadata.key_value_metadata() {
-        println!("Key-value metadata:");
-        for kv in key_value_metadata {
-            println!("  {}: {}", kv.key, kv.value.as_deref().unwrap_or(""));
-        }
-    }
-    Ok(())
-}
-
-pub fn get_orc_metadata(file_path: &str) -> Result<()> {
-    let source = DataSource::open(file_path)?;
-    let reader_builder = ArrowReaderBuilder::try_new(source.reader_file()?).map_err(Error::new)?;
-    let metadata = reader_builder.file_metadata();
-
-    println!("Number of rows: {}", metadata.number_of_rows());
-
-    if !metadata.user_custom_metadata().is_empty() {
-        println!("User metadata:");
-        for (key, value) in metadata.user_custom_metadata() {
-            println!("  {}: {:?}", key, value);
-        }
-    }
-    Ok(())
-}
