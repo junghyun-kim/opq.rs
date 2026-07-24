@@ -65,32 +65,6 @@ fn parse_single_sort_spec(spec: &str) -> Result<SortSpec> {
     })
 }
 
-/// Validate that all sort columns are present in the selected columns
-pub fn validate_sort_columns(
-    sort_specs: &[SortSpec],
-    selected_columns: Option<&[String]>,
-    all_columns: &[String],
-) -> Result<()> {
-    for spec in sort_specs {
-        // Check if column exists in the file
-        if !all_columns.contains(&spec.column) {
-            return Err(anyhow!("Sort column '{}' does not exist in the file", spec.column));
-        }
-        
-        // Check if column is selected (if column selection is used)
-        if let Some(cols) = selected_columns {
-            if !cols.contains(&spec.column) {
-                return Err(anyhow!(
-                    "Sort column '{}' must be included in --columns selection", 
-                    spec.column
-                ));
-            }
-        }
-    }
-    
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,31 +125,6 @@ mod tests {
     #[test]
     fn test_invalid_order() {
         let result = parse_single_sort_spec("name:invalid");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_sort_columns() {
-        let sort_specs = vec![
-            SortSpec { column: "name".to_string(), ascending: true },
-            SortSpec { column: "age".to_string(), ascending: false },
-        ];
-        
-        let all_columns = vec!["name".to_string(), "age".to_string(), "salary".to_string()];
-        let selected_columns = vec!["name".to_string(), "age".to_string()];
-        
-        // Should pass validation
-        let result = validate_sort_columns(&sort_specs, Some(&selected_columns), &all_columns);
-        assert!(result.is_ok());
-        
-        // Should fail when sort column not in selection
-        let limited_selection = vec!["name".to_string()];
-        let result = validate_sort_columns(&sort_specs, Some(&limited_selection), &all_columns);
-        assert!(result.is_err());
-        
-        // Should fail when sort column doesn't exist
-        let invalid_spec = vec![SortSpec { column: "nonexistent".to_string(), ascending: true }];
-        let result = validate_sort_columns(&invalid_spec, None, &all_columns);
         assert!(result.is_err());
     }
 }

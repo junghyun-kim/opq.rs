@@ -32,10 +32,11 @@ Note: Vertical format has been removed. Use table format for structured output o
   - Supports top-level columns only (e.g., `name`, `age`, `address`)
   - Nested field selection (e.g., `address.city`) is not currently supported
   - Complex nested structures are returned as complete objects
-- **Intelligent Sorting** - Sort data by single or multiple columns with flexible syntax
-  - Adaptive strategy: TopK for small datasets, External Sort for large files
-  - Memory-efficient streaming processing for large files
+- **Sorting** - Sort data by single or multiple columns with flexible syntax
+  - Single DataFusion-based engine for ORC, Parquet, and compressed files
+  - With a row limit, the sort runs as a streaming TopK (only `limit` rows kept in memory)
   - Multiple sort formats: `column`, `column+/-`, `column:asc/desc`
+  - Sort columns don't need to be included in `--columns`
 - **Streaming Processing** - Memory-efficient handling of large files
 - **Auto-detection** - Automatic file type and compression format detection
 
@@ -89,6 +90,9 @@ opq view data.parquet
 
 # View first 20 rows
 opq view data.orc --limit 20
+
+# View all rows
+opq view data.orc --limit 0
 
 # Export to NDJSON format
 opq view data.parquet.gz --format ndjson --limit 100
@@ -245,9 +249,10 @@ opq view transactions.parquet --columns "timestamp,user_id,amount" --sort "times
 | `column:desc` | Explicit descending | `--sort "date:desc"` |
 
 #### Sorting Performance
-- **Small datasets (< 1000 rows)**: Uses TopK optimization for faster results
-- **Large datasets**: Uses external sorting with streaming for memory efficiency
-- **Memory usage**: Constant memory usage regardless of file size with streaming approach
+- All formats share one DataFusion-based sort pipeline (scan → sort → project → limit)
+- With a `--limit`, DataFusion executes the sort as a streaming TopK, keeping only `limit` rows in memory
+- Uncompressed Parquet is scanned natively by DataFusion (parallel, with projection pushdown)
+- ORC and compressed files stream through opq's own readers into DataFusion
 
 ### Working with Multiple Files
 ```bash
@@ -343,7 +348,20 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Changelog
 
-### v0.3.0 (Latest)
+### v0.4.0 (Latest)
+- **Fixed**: Sorting now returns globally correct results (previously data was only sorted within each batch, and large ORC files stopped being read early)
+- **Fixed**: Sorting works on compressed files (previously failed with a file-extension error)
+- **Fixed**: `--truncate` no longer panics on multi-byte UTF-8 text (now truncates by characters)
+- **Fixed**: Dates, timestamps, decimals, and nested types render properly in table output (previously showed placeholders like `<Date32>`)
+- **Fixed**: Build failure caused by two incompatible arrow versions being resolved; `Cargo.lock` is now committed for reproducible builds
+- **New**: `--limit 0` displays all rows
+- **New**: Sort columns no longer need to be included in `--columns`
+- **Changed**: All sorting paths unified into a single DataFusion pipeline; with `--limit` the sort executes as a streaming TopK
+- **Changed**: ORC reading is now lazy/streaming instead of loading the whole file up front
+- **Removed**: Dead `main_new.rs` and unused vertical-format code
+- **Added**: End-to-end CLI test suite covering sorting, compression, formatting, and limits
+
+### v0.3.0
 - **New Feature**: Intelligent sorting functionality with adaptive strategy
 - **New Feature**: Support for multiple sort formats (`column`, `column+/-`, `column:asc/desc`)
 - **New Feature**: Multi-column sorting with mixed ascending/descending orders

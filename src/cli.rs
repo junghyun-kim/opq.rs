@@ -41,13 +41,13 @@ pub enum Commands {
         /// Column names to select (if not specified, selects all)
         #[arg(short, long, value_delimiter = ',')]
         columns: Option<Vec<String>>,
-        /// Number of rows to limit (default: 10)
+        /// Number of rows to display (0 = all rows)
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
         /// Output format
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
-        /// Truncate long column values (0 to disable, default: disabled)
+        /// Truncate column values longer than this many characters (0 to disable)
         #[arg(short, long, default_value_t = 0)]
         truncate: usize,
         /// Sort columns. Format: "col1,col2-,col3:desc" (default: ascending)

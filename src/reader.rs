@@ -1,24 +1,25 @@
-use anyhow::{Error, Result};
-use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
-// No longer need compatibility layer since we simplified the approach
+use anyhow::{Error, Result, anyhow};
+use arrow_array::RecordBatchReader;
+use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use orc_rust::arrow_reader::ArrowReaderBuilder;
 use orc_rust::projection::ProjectionMask as OrcProjectionMask;
 use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::file::reader::{ChunkReader as ParquetChunkReader, FileReader, SerializedFileReader};
 use snap::read::FrameDecoder as SnappyDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zstd::stream::read::Decoder as ZstdDecoder;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Parquet,
     Orc,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionType {
     None,
     Gzip,
@@ -51,7 +52,6 @@ pub fn get_file_type(file_path: &str) -> Result<FileType> {
     // Remove compression extensions to get the actual file type
     let mut core_name = file_name;
 
-    // Remove each compression extension one by one
     if let Some(name) = core_name.strip_suffix(".gz") {
         core_name = name;
     } else if let Some(name) = core_name.strip_suffix(".zlib") {
@@ -73,458 +73,194 @@ pub fn get_file_type(file_path: &str) -> Result<FileType> {
     } else if core_name.ends_with(".orc") {
         Ok(FileType::Orc)
     } else {
-        Err(anyhow::Error::msg(format!(
-            "Unsupported file type for file: {}",
-            file_path
-        )))
+        Err(anyhow!("Unsupported file type for file: {}", file_path))
     }
 }
 
-pub struct ArrowBatchIterator {
-    reader: Box<dyn Iterator<Item = Result<RecordBatch>>>,
+/// Where batches are read from.
+///
+/// Uncompressed files stay on disk and are opened lazily per reader, so data
+/// is only decoded as batches are consumed. Compressed files must be fully
+/// decompressed up front (Parquet/ORC readers need random access), but the
+/// decompressed buffer is shared cheaply between readers via `Bytes`.
+#[derive(Clone)]
+pub enum DataSource {
+    File(PathBuf),
+    Memory(Bytes),
 }
 
-impl ArrowBatchIterator {
-    pub fn new_from_batches(batches: Vec<RecordBatch>) -> Self {
-        let iter = batches.into_iter().map(Ok);
-        Self {
-            reader: Box::new(iter),
+impl DataSource {
+    pub fn open(file_path: &str) -> Result<Self> {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            return Err(anyhow!("File not found: {}", file_path));
         }
-    }
 
-    pub fn new_from_parquet_reader(
-        reader: impl Iterator<Item = arrow::error::Result<RecordBatch>> + 'static,
-    ) -> Self {
-        let iter = reader.map(|batch| batch.map_err(Error::new));
-        Self {
-            reader: Box::new(iter),
+        let compression = detect_compression_from_extension(file_path);
+        if matches!(compression, CompressionType::None) {
+            return Ok(DataSource::File(path.to_path_buf()));
         }
+
+        let file = BufReader::new(File::open(path).map_err(Error::new)?);
+        let mut reader: Box<dyn Read> = match compression {
+            CompressionType::None => unreachable!(),
+            CompressionType::Gzip => Box::new(GzDecoder::new(file)),
+            CompressionType::Zlib => Box::new(ZlibDecoder::new(file)),
+            CompressionType::Snappy => Box::new(SnappyDecoder::new(file)),
+            CompressionType::Zstd => Box::new(ZstdDecoder::new(file).map_err(Error::new)?),
+        };
+
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).map_err(Error::new)?;
+        Ok(DataSource::Memory(Bytes::from(buffer)))
     }
 }
 
-impl Iterator for ArrowBatchIterator {
-    type Item = Result<RecordBatch>;
+pub type BatchReader = Box<dyn RecordBatchReader + Send>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.reader.next()
+/// Open a streaming batch reader over `source`, optionally projecting to the
+/// given top-level columns. Can be called repeatedly on the same source.
+pub fn open_batch_reader(
+    source: &DataSource,
+    file_type: FileType,
+    columns: Option<&[String]>,
+) -> Result<BatchReader> {
+    match (file_type, source) {
+        (FileType::Parquet, DataSource::File(path)) => {
+            open_parquet_reader(File::open(path).map_err(Error::new)?, columns)
+        }
+        (FileType::Parquet, DataSource::Memory(bytes)) => {
+            open_parquet_reader(bytes.clone(), columns)
+        }
+        (FileType::Orc, DataSource::File(path)) => {
+            open_orc_reader(File::open(path).map_err(Error::new)?, columns)
+        }
+        (FileType::Orc, DataSource::Memory(bytes)) => open_orc_reader(bytes.clone(), columns),
     }
 }
 
-fn create_decompressed_reader(file_path: &str) -> Result<Box<dyn Read>> {
-    let file = File::open(file_path).map_err(Error::new)?;
-    let compression = detect_compression_from_extension(file_path);
+fn open_parquet_reader<R>(input: R, columns: Option<&[String]>) -> Result<BatchReader>
+where
+    R: ParquetChunkReader + Send + 'static,
+{
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(input).map_err(Error::new)?;
 
-    match compression {
-        CompressionType::None => Ok(Box::new(BufReader::new(file))),
-        CompressionType::Gzip => Ok(Box::new(GzDecoder::new(BufReader::new(file)))),
-        CompressionType::Zlib => Ok(Box::new(ZlibDecoder::new(BufReader::new(file)))),
-        CompressionType::Snappy => Ok(Box::new(SnappyDecoder::new(BufReader::new(file)))),
-        CompressionType::Zstd => Ok(Box::new(
-            ZstdDecoder::new(BufReader::new(file)).map_err(Error::new)?,
+    if let Some(column_names) = columns {
+        let indices = column_indices(&builder.schema().clone(), column_names)?;
+        let projection = ProjectionMask::roots(builder.parquet_schema(), indices);
+        builder = builder.with_projection(projection);
+    }
+
+    Ok(Box::new(builder.build().map_err(Error::new)?))
+}
+
+fn open_orc_reader<R>(input: R, columns: Option<&[String]>) -> Result<BatchReader>
+where
+    R: orc_rust::reader::ChunkReader + Send + 'static,
+{
+    let builder = ArrowReaderBuilder::try_new(input).map_err(Error::new)?;
+
+    let builder = if let Some(column_names) = columns {
+        column_indices(&builder.schema(), column_names)?; // validate names
+        let root_data_type = builder.file_metadata().root_data_type();
+        let projection = OrcProjectionMask::named_roots(root_data_type, column_names);
+        builder.with_projection(projection)
+    } else {
+        builder
+    };
+
+    Ok(Box::new(builder.build()))
+}
+
+fn column_indices(schema: &SchemaRef, column_names: &[String]) -> Result<Vec<usize>> {
+    column_names
+        .iter()
+        .map(|name| {
+            schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .ok_or_else(|| anyhow!("Column '{}' not found in schema", name))
+        })
+        .collect()
+}
+
+/// Arrow schema of the file (used for tree display and validation).
+pub fn get_arrow_schema(file_path: &str) -> Result<SchemaRef> {
+    let file_type = get_file_type(file_path)?;
+    let source = DataSource::open(file_path)?;
+    Ok(open_batch_reader(&source, file_type, None)?.schema())
+}
+
+/// Native schema representation as a debug string.
+pub fn get_raw_schema_string(file_path: &str) -> Result<String> {
+    let file_type = get_file_type(file_path)?;
+    let source = DataSource::open(file_path)?;
+
+    match file_type {
+        FileType::Parquet => match &source {
+            DataSource::File(path) => raw_parquet_schema(File::open(path).map_err(Error::new)?),
+            DataSource::Memory(bytes) => raw_parquet_schema(bytes.clone()),
+        },
+        FileType::Orc => Ok(format!(
+            "{:#?}",
+            open_batch_reader(&source, file_type, None)?.schema()
         )),
     }
 }
 
-pub fn read_parquet_to_arrow_with_projection(
-    file_path: &str,
-    columns: Option<Vec<String>>,
-) -> Result<ArrowBatchIterator> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly - streaming
-            let file = File::open(&path).map_err(Error::new)?;
-            let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(Error::new)?;
-
-            // Apply column projection if specified
-            if let Some(column_names) = columns {
-                let schema = builder.schema();
-                let mut column_indices = Vec::new();
-
-                for column_name in &column_names {
-                    if let Some(index) =
-                        schema.fields().iter().position(|f| f.name() == column_name)
-                    {
-                        column_indices.push(index);
-                    } else {
-                        return Err(anyhow::Error::msg(format!(
-                            "Column '{}' not found in schema",
-                            column_name
-                        )));
-                    }
-                }
-
-                let projection = ProjectionMask::roots(builder.parquet_schema(), column_indices);
-                builder = builder.with_projection(projection);
-            }
-
-            let reader = builder.build().map_err(Error::new)?;
-            Ok(ArrowBatchIterator::new_from_parquet_reader(reader))
-        }
-        _ => {
-            // For compressed files, we still need to decompress to memory
-            // This is a limitation of current Parquet/ORC libraries
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(Error::new)?;
-
-            // Apply column projection if specified
-            if let Some(column_names) = columns {
-                let schema = builder.schema();
-                let mut column_indices = Vec::new();
-
-                for column_name in &column_names {
-                    if let Some(index) =
-                        schema.fields().iter().position(|f| f.name() == column_name)
-                    {
-                        column_indices.push(index);
-                    } else {
-                        return Err(anyhow::Error::msg(format!(
-                            "Column '{}' not found in schema",
-                            column_name
-                        )));
-                    }
-                }
-
-                let projection = ProjectionMask::roots(builder.parquet_schema(), column_indices);
-                builder = builder.with_projection(projection);
-            }
-
-            let reader = builder.build().map_err(Error::new)?;
-            Ok(ArrowBatchIterator::new_from_parquet_reader(reader))
-        }
-    }
-}
-
-pub fn read_orc_to_arrow_with_projection(
-    file_path: &str,
-    columns: Option<Vec<String>>,
-) -> Result<ArrowBatchIterator> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader_builder = ArrowReaderBuilder::try_new(file).map_err(Error::new)?;
-
-            // Apply column projection if specified
-            let reader_builder = if let Some(column_names) = columns {
-                let file_metadata = reader_builder.file_metadata();
-                let root_data_type = file_metadata.root_data_type();
-                let projection = OrcProjectionMask::named_roots(root_data_type, &column_names);
-                reader_builder.with_projection(projection)
-            } else {
-                reader_builder
-            };
-
-            let mut reader = reader_builder.build();
-
-            let mut batches = Vec::new();
-            loop {
-                let batch_result = reader.next();
-                let batch = match batch_result {
-                    Some(b) => b.map_err(Error::new)?,
-                    None => break,
-                };
-                batches.push(batch);
-            }
-
-            Ok(ArrowBatchIterator::new_from_batches(batches))
-        }
-        _ => {
-            // For compressed files, we need to decompress first and create a temporary buffer
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader_builder = ArrowReaderBuilder::try_new(bytes).map_err(Error::new)?;
-
-            // Apply column projection if specified
-            let reader_builder = if let Some(column_names) = columns {
-                let file_metadata = reader_builder.file_metadata();
-                let root_data_type = file_metadata.root_data_type();
-                let projection = OrcProjectionMask::named_roots(root_data_type, &column_names);
-                reader_builder.with_projection(projection)
-            } else {
-                reader_builder
-            };
-
-            let mut reader = reader_builder.build();
-
-            let mut batches = Vec::new();
-            loop {
-                let batch_result = reader.next();
-                let batch = match batch_result {
-                    Some(b) => b.map_err(Error::new)?,
-                    None => break,
-                };
-                batches.push(batch);
-            }
-
-            Ok(ArrowBatchIterator::new_from_batches(batches))
-        }
-    }
-}
-
-use parquet::file::reader::{FileReader, SerializedFileReader};
-
-pub fn get_parquet_arrow_schema(file_path: &str) -> Result<ArrowSchema> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(Error::new)?;
-            Ok(builder.schema().as_ref().clone())
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(Error::new)?;
-            Ok(builder.schema().as_ref().clone())
-        }
-    }
-}
-
-pub fn get_parquet_schema(file_path: &str) -> Result<String> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader = SerializedFileReader::new(file).map_err(Error::new)?;
-            let metadata = reader.metadata();
-            let schema = metadata.file_metadata().schema();
-            Ok(format!("{:#?}", schema))
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader = SerializedFileReader::new(bytes).map_err(Error::new)?;
-            let metadata = reader.metadata();
-            let schema = metadata.file_metadata().schema();
-            Ok(format!("{:#?}", schema))
-        }
-    }
-}
-
-pub fn get_orc_schema(file_path: &str) -> Result<String> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader_builder = ArrowReaderBuilder::try_new(file).map_err(Error::new)?;
-            let schema = reader_builder.schema();
-            Ok(format!("{:#?}", schema))
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader_builder = ArrowReaderBuilder::try_new(bytes).map_err(Error::new)?;
-            let schema = reader_builder.schema();
-            Ok(format!("{:#?}", schema))
-        }
-    }
-}
-
-pub fn get_orc_arrow_schema(file_path: &str) -> Result<ArrowSchema> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader_builder = ArrowReaderBuilder::try_new(file).map_err(Error::new)?;
-            let schema = reader_builder.schema();
-            Ok(schema.as_ref().clone())
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader_builder = ArrowReaderBuilder::try_new(bytes).map_err(Error::new)?;
-            let schema = reader_builder.schema();
-            Ok(schema.as_ref().clone())
-        }
-    }
+fn raw_parquet_schema<R: ParquetChunkReader + 'static>(input: R) -> Result<String> {
+    let reader = SerializedFileReader::new(input).map_err(Error::new)?;
+    let schema = reader.metadata().file_metadata().schema();
+    Ok(format!("{:#?}", schema))
 }
 
 pub fn get_parquet_metadata(file_path: &str) -> Result<()> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
-    }
-
-    let compression = detect_compression_from_extension(file_path);
-
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader = SerializedFileReader::new(file).map_err(Error::new)?;
-            let metadata = reader.metadata();
-            let file_metadata = metadata.file_metadata();
-
-            println!("Number of row groups: {}", metadata.num_row_groups());
-            println!("Number of rows: {}", file_metadata.num_rows());
-            println!(
-                "Created by: {}",
-                file_metadata.created_by().unwrap_or("N/A")
-            );
-
-            if let Some(key_value_metadata) = file_metadata.key_value_metadata() {
-                println!("Key-value metadata:");
-                for kv in key_value_metadata {
-                    println!("  {}: {}", kv.key, kv.value.as_deref().unwrap_or(""));
-                }
-            }
-            Ok(())
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader = SerializedFileReader::new(bytes).map_err(Error::new)?;
-            let metadata = reader.metadata();
-            let file_metadata = metadata.file_metadata();
-
-            println!("Number of row groups: {}", metadata.num_row_groups());
-            println!("Number of rows: {}", file_metadata.num_rows());
-            println!(
-                "Created by: {}",
-                file_metadata.created_by().unwrap_or("N/A")
-            );
-
-            if let Some(key_value_metadata) = file_metadata.key_value_metadata() {
-                println!("Key-value metadata:");
-                for kv in key_value_metadata {
-                    println!("  {}: {}", kv.key, kv.value.as_deref().unwrap_or(""));
-                }
-            }
-            Ok(())
-        }
+    match DataSource::open(file_path)? {
+        DataSource::File(path) => print_parquet_metadata(File::open(path).map_err(Error::new)?),
+        DataSource::Memory(bytes) => print_parquet_metadata(bytes),
     }
 }
 
+fn print_parquet_metadata<R: ParquetChunkReader + 'static>(input: R) -> Result<()> {
+    let reader = SerializedFileReader::new(input).map_err(Error::new)?;
+    let metadata = reader.metadata();
+    let file_metadata = metadata.file_metadata();
+
+    println!("Number of row groups: {}", metadata.num_row_groups());
+    println!("Number of rows: {}", file_metadata.num_rows());
+    println!(
+        "Created by: {}",
+        file_metadata.created_by().unwrap_or("N/A")
+    );
+
+    if let Some(key_value_metadata) = file_metadata.key_value_metadata() {
+        println!("Key-value metadata:");
+        for kv in key_value_metadata {
+            println!("  {}: {}", kv.key, kv.value.as_deref().unwrap_or(""));
+        }
+    }
+    Ok(())
+}
+
 pub fn get_orc_metadata(file_path: &str) -> Result<()> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow::Error::msg(format!("File not found: {}", file_path)));
+    match DataSource::open(file_path)? {
+        DataSource::File(path) => print_orc_metadata(File::open(path).map_err(Error::new)?),
+        DataSource::Memory(bytes) => print_orc_metadata(bytes),
     }
+}
 
-    let compression = detect_compression_from_extension(file_path);
+fn print_orc_metadata<R: orc_rust::reader::ChunkReader>(input: R) -> Result<()> {
+    let reader_builder = ArrowReaderBuilder::try_new(input).map_err(Error::new)?;
+    let metadata = reader_builder.file_metadata();
 
-    match compression {
-        CompressionType::None => {
-            // Read uncompressed file directly
-            let file = File::open(&path).map_err(Error::new)?;
-            let reader_builder = ArrowReaderBuilder::try_new(file).map_err(Error::new)?;
-            let metadata = reader_builder.file_metadata();
+    println!("Number of rows: {}", metadata.number_of_rows());
 
-            println!("Number of rows: {}", metadata.number_of_rows());
-
-            if !metadata.user_custom_metadata().is_empty() {
-                println!("User metadata:");
-                for (key, value) in metadata.user_custom_metadata() {
-                    println!("  {}: {:?}", key, value);
-                }
-            }
-            Ok(())
-        }
-        _ => {
-            // For compressed files, decompress first
-            let mut decompressed_reader = create_decompressed_reader(file_path)?;
-            let mut buffer = Vec::new();
-            decompressed_reader
-                .read_to_end(&mut buffer)
-                .map_err(Error::new)?;
-
-            let bytes = Bytes::from(buffer);
-            let reader_builder = ArrowReaderBuilder::try_new(bytes).map_err(Error::new)?;
-            let metadata = reader_builder.file_metadata();
-
-            println!("Number of rows: {}", metadata.number_of_rows());
-
-            if !metadata.user_custom_metadata().is_empty() {
-                println!("User metadata:");
-                for (key, value) in metadata.user_custom_metadata() {
-                    println!("  {}: {:?}", key, value);
-                }
-            }
-            Ok(())
+    if !metadata.user_custom_metadata().is_empty() {
+        println!("User metadata:");
+        for (key, value) in metadata.user_custom_metadata() {
+            println!("  {}: {:?}", key, value);
         }
     }
+    Ok(())
 }
