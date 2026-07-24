@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod metadata;
 mod output;
 mod reader;
 mod schema;
@@ -24,6 +25,20 @@ async fn main() -> Result<()> {
             format,
             truncate,
             sort,
-        } => handle_view_command(file, columns, *limit, format, *truncate, sort).await,
+            filter,
+            memory_limit,
+        } => {
+            handle_view_command(
+                file,
+                columns,
+                *limit,
+                format,
+                *truncate,
+                sort,
+                filter,
+                *memory_limit,
+            )
+            .await
+        }
     }
 }

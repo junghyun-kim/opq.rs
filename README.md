@@ -22,20 +22,27 @@ Note: Vertical format has been removed. Use table format for structured output o
 
 ### Commands
 - **schema** - View file schema and structure with tree visualization support
-- **metadata** - View file metadata and statistics 
-- **view** - View file contents with customizable output formats, column selection, and intelligent sorting
+- **metadata** - View file metadata and footer statistics: row group / stripe breakdown with sizes and compression ratios, and per-column type, codec, null count, and min/max — read from the footer only, so it's instant even on multi-GB files
+- **view** - View file contents with filtering, sorting, column selection, and customizable output formats
 
 ### Advanced Features
+- **Filtering** - Filter rows with SQL expressions via `--filter`
+  - Comparisons, boolean logic, string matching: `"age > 30 AND city = 'Seoul'"`
+  - Works on any format (ORC, Parquet, compressed) and combines with sorting and column selection
+  - Filter columns don't need to be included in `--columns`
+  - On uncompressed Parquet, predicates prune row groups for fast scans
 - **Tree Schema Visualization** - Hierarchical display of complex nested structures
 - **Multiple File Support** - Process multiple files with schema and metadata commands
 - **Column Selection** - Choose specific columns for better performance and focused analysis
   - Supports top-level columns only (e.g., `name`, `age`, `address`)
   - Nested field selection (e.g., `address.city`) is not currently supported
   - Complex nested structures are returned as complete objects
-- **Intelligent Sorting** - Sort data by single or multiple columns with flexible syntax
-  - Adaptive strategy: TopK for small datasets, External Sort for large files
-  - Memory-efficient streaming processing for large files
+- **Sorting** - Sort data by single or multiple columns with flexible syntax
+  - Single DataFusion-based engine for ORC, Parquet, and compressed files
+  - With a row limit, the sort runs as a streaming TopK (only `limit` rows kept in memory)
+  - Full sorts larger than `--memory-limit` (default 1G) automatically spill to disk (external sort)
   - Multiple sort formats: `column`, `column+/-`, `column:asc/desc`
+  - Sort columns don't need to be included in `--columns`
 - **Streaming Processing** - Memory-efficient handling of large files
 - **Auto-detection** - Automatic file type and compression format detection
 
@@ -90,6 +97,9 @@ opq view data.parquet
 # View first 20 rows
 opq view data.orc --limit 20
 
+# View all rows
+opq view data.orc --limit 0
+
 # Export to NDJSON format
 opq view data.parquet.gz --format ndjson --limit 100
 
@@ -101,6 +111,12 @@ opq view data.parquet --columns "name" --limit 5
 
 # Select nested structures as complete objects
 opq view nested_data.parquet --columns "id,address,metadata" --limit 5
+
+# Filter rows with a SQL expression
+opq view data.parquet --filter "age > 30" --limit 10
+
+# Combine filtering, sorting, and column selection
+opq view data.parquet --columns "name,age" --filter "city = 'Seoul'" --sort "age-" --limit 10
 
 # Sort data by columns (ascending by default)
 opq view data.parquet --sort "name" --limit 10
@@ -200,6 +216,29 @@ opq view dataset.parquet --columns "name,age,salary" --sort "age-,salary:desc" -
 opq view dataset.parquet --columns "id,name,email" --format ndjson --limit 1000 > sample.jsonl
 ```
 
+### Filtering Examples
+
+```bash
+# Numeric comparison
+opq view employees.parquet --filter "salary >= 50000" --limit 20
+
+# String equality and boolean logic
+opq view employees.parquet --filter "department = 'Engineering' AND age < 40"
+
+# Filter on a column that is not displayed
+opq view employees.parquet --columns "name" --filter "salary > 100000"
+
+# Filter then sort: show the 10 largest recent transactions
+opq view transactions.orc --filter "amount > 0" --sort "amount:desc" --limit 10
+
+# Export all matching rows
+opq view logs.parquet.gz --filter "level = 'ERROR'" --limit 0 --format ndjson > errors.jsonl
+```
+
+Filter expressions use SQL syntax: comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`),
+boolean logic (`AND`, `OR`, `NOT`), `IN (...)`, `BETWEEN`, `LIKE`, and `IS [NOT] NULL`.
+String literals use single quotes. Column names are matched exactly (case-sensitive).
+
 ### Sorting Examples
 
 #### Basic Sorting
@@ -215,6 +254,9 @@ opq view employees.parquet --sort "age-" --limit 20
 
 # Sort using explicit syntax
 opq view employees.parquet --sort "salary:desc" --limit 20
+
+# Full sort of a large file within a memory budget (spills to disk when exceeded)
+opq view huge_dataset.parquet --sort "timestamp" --limit 0 --memory-limit 512M
 ```
 
 #### Multi-Column Sorting
@@ -245,9 +287,14 @@ opq view transactions.parquet --columns "timestamp,user_id,amount" --sort "times
 | `column:desc` | Explicit descending | `--sort "date:desc"` |
 
 #### Sorting Performance
-- **Small datasets (< 1000 rows)**: Uses TopK optimization for faster results
-- **Large datasets**: Uses external sorting with streaming for memory efficiency
-- **Memory usage**: Constant memory usage regardless of file size with streaming approach
+- All formats share one DataFusion-based sort pipeline (scan → sort → project → limit)
+- With a `--limit`, DataFusion executes the sort as a streaming TopK, keeping only `limit` rows in memory
+- Full sorts (`--limit 0`) run in memory while they fit within `--memory-limit` (default `1G`);
+  beyond that, sorted runs spill to temporary disk files and are merged (external sort),
+  so peak memory stays bounded regardless of file size
+- `--memory-limit 0` disables the budget (everything stays in memory)
+- Uncompressed Parquet is scanned natively by DataFusion (parallel, with projection pushdown)
+- ORC and compressed files stream through opq's own readers into DataFusion
 
 ### Working with Multiple Files
 ```bash
@@ -303,10 +350,10 @@ OPQ.RS is designed to handle large files efficiently:
 - **Memory usage** - Constant memory usage regardless of file size
 - **5GB+ files** - No memory issues, processes in batches
 
-#### ⚠️ **Compressed Files (Memory considerations)**
-- **Memory requirement** - Decompressed file size + processing overhead
-- **5GB compressed file** - May require 6-8GB available memory
-- **Recommendation** - For very large files, use uncompressed format when possible
+#### ✅ **Compressed Files**
+- **Streaming decompression** - Compressed inputs are streamed into a temporary file (constant memory), then read with random access
+- **Disk requirement** - Needs free space for the decompressed copy in the system temp directory (respects `TMPDIR`)
+- **Memory usage** - Stays flat regardless of the compressed file's size
 
 #### 💡 **Best Practices for Large Files**
 ```bash
@@ -328,6 +375,13 @@ opq view huge_file.parquet --limit 1000 --format ndjson > sample.jsonl
 - Rust 1.89.0 or later
 - macOS, Linux, or Windows
 
+## Roadmap
+
+- `opq convert` — convert ORC (and compressed inputs) to Parquet, bridging tools without ORC support (e.g. DuckDB)
+- Multiple file support for `view`
+- Magic-byte file type detection (extension-independent)
+- Nested field selection (`address.city`)
+
 ## Contributing
 
 1. Fork the repository
@@ -343,7 +397,24 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Changelog
 
-### v0.3.0 (Latest)
+### v0.4.0 (Latest)
+- **New**: `--filter` — filter rows with SQL expressions (`--filter "age > 30 AND city = 'Seoul'"`); works on all formats, combines with sorting/column selection, and prunes Parquet row groups for fast scans
+- **Fixed**: Sorting now returns globally correct results (previously data was only sorted within each batch, and large ORC files stopped being read early)
+- **Fixed**: Sorting works on compressed files (previously failed with a file-extension error)
+- **Fixed**: `--truncate` no longer panics on multi-byte UTF-8 text (now truncates by characters)
+- **Fixed**: Dates, timestamps, decimals, and nested types render properly in table output (previously showed placeholders like `<Date32>`)
+- **Fixed**: Build failure caused by two incompatible arrow versions being resolved; `Cargo.lock` is now committed for reproducible builds
+- **New**: `--limit 0` displays all rows
+- **New**: `--memory-limit` (default `1G`) — full sorts larger than the budget automatically spill to temporary disk files (true external sort); smaller sorts stay in memory
+- **New**: `metadata` shows footer statistics — file size, row group / stripe breakdown with compression ratios, and per-column type, codec, null count, and min/max (dates formatted; nested types degrade gracefully)
+- **New**: Sort columns no longer need to be included in `--columns`
+- **Changed**: All sorting paths unified into a single DataFusion pipeline; with `--limit` the sort executes as a streaming TopK
+- **Changed**: ORC reading is now lazy/streaming instead of loading the whole file up front
+- **Changed**: Compressed inputs are streamed to a temporary file instead of being buffered in memory, so memory usage no longer scales with the decompressed size
+- **Removed**: Dead `main_new.rs` and unused vertical-format code
+- **Added**: End-to-end CLI test suite covering sorting, compression, formatting, and limits
+
+### v0.3.0
 - **New Feature**: Intelligent sorting functionality with adaptive strategy
 - **New Feature**: Support for multiple sort formats (`column`, `column+/-`, `column:asc/desc`)
 - **New Feature**: Multi-column sorting with mixed ascending/descending orders

@@ -1,8 +1,5 @@
 use crate::cli::SchemaFormat;
-use crate::reader::{
-    FileType, get_file_type, get_orc_arrow_schema, get_orc_schema, get_parquet_arrow_schema,
-    get_parquet_schema,
-};
+use crate::reader::{FileType, get_arrow_schema, get_file_type, get_raw_schema_string};
 use anyhow::Result;
 use arrow_schema::{DataType, Field, Schema};
 
@@ -10,27 +7,18 @@ pub fn show_schema(file: &str, format: &SchemaFormat) -> Result<()> {
     println!("=== {} ===", file);
     let file_type = get_file_type(file)?;
 
-    match file_type {
-        FileType::Parquet => match format {
-            SchemaFormat::Raw => {
-                let schema = get_parquet_schema(file)?;
-                println!("{}", schema);
-            }
-            SchemaFormat::Tree => {
-                let arrow_schema = get_parquet_arrow_schema(file)?;
-                print_arrow_schema_tree(&arrow_schema, "parquet");
-            }
-        },
-        FileType::Orc => match format {
-            SchemaFormat::Raw => {
-                let schema = get_orc_schema(file)?;
-                println!("{}", schema);
-            }
-            SchemaFormat::Tree => {
-                let arrow_schema = get_orc_arrow_schema(file)?;
-                print_arrow_schema_tree(&arrow_schema, "orc");
-            }
-        },
+    match format {
+        SchemaFormat::Raw => {
+            println!("{}", get_raw_schema_string(file)?);
+        }
+        SchemaFormat::Tree => {
+            let arrow_schema = get_arrow_schema(file)?;
+            let label = match file_type {
+                FileType::Parquet => "parquet",
+                FileType::Orc => "orc",
+            };
+            print_arrow_schema_tree(&arrow_schema, label);
+        }
     }
 
     Ok(())
@@ -105,7 +93,7 @@ fn print_arrow_field_recursive(
     }
 }
 
-fn format_arrow_data_type(data_type: &DataType) -> String {
+pub(crate) fn format_arrow_data_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Null => "NULL".to_string(),
         DataType::Boolean => "BOOLEAN".to_string(),
