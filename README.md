@@ -35,6 +35,7 @@ Note: Vertical format has been removed. Use table format for structured output o
 - **Sorting** - Sort data by single or multiple columns with flexible syntax
   - Single DataFusion-based engine for ORC, Parquet, and compressed files
   - With a row limit, the sort runs as a streaming TopK (only `limit` rows kept in memory)
+  - Full sorts larger than `--memory-limit` (default 1G) automatically spill to disk (external sort)
   - Multiple sort formats: `column`, `column+/-`, `column:asc/desc`
   - Sort columns don't need to be included in `--columns`
 - **Streaming Processing** - Memory-efficient handling of large files
@@ -219,6 +220,9 @@ opq view employees.parquet --sort "age-" --limit 20
 
 # Sort using explicit syntax
 opq view employees.parquet --sort "salary:desc" --limit 20
+
+# Full sort of a large file within a memory budget (spills to disk when exceeded)
+opq view huge_dataset.parquet --sort "timestamp" --limit 0 --memory-limit 512M
 ```
 
 #### Multi-Column Sorting
@@ -251,6 +255,10 @@ opq view transactions.parquet --columns "timestamp,user_id,amount" --sort "times
 #### Sorting Performance
 - All formats share one DataFusion-based sort pipeline (scan → sort → project → limit)
 - With a `--limit`, DataFusion executes the sort as a streaming TopK, keeping only `limit` rows in memory
+- Full sorts (`--limit 0`) run in memory while they fit within `--memory-limit` (default `1G`);
+  beyond that, sorted runs spill to temporary disk files and are merged (external sort),
+  so peak memory stays bounded regardless of file size
+- `--memory-limit 0` disables the budget (everything stays in memory)
 - Uncompressed Parquet is scanned natively by DataFusion (parallel, with projection pushdown)
 - ORC and compressed files stream through opq's own readers into DataFusion
 
@@ -355,6 +363,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - **Fixed**: Dates, timestamps, decimals, and nested types render properly in table output (previously showed placeholders like `<Date32>`)
 - **Fixed**: Build failure caused by two incompatible arrow versions being resolved; `Cargo.lock` is now committed for reproducible builds
 - **New**: `--limit 0` displays all rows
+- **New**: `--memory-limit` (default `1G`) — full sorts larger than the budget automatically spill to temporary disk files (true external sort); smaller sorts stay in memory
 - **New**: Sort columns no longer need to be included in `--columns`
 - **Changed**: All sorting paths unified into a single DataFusion pipeline; with `--limit` the sort executes as a streaming TopK
 - **Changed**: ORC reading is now lazy/streaming instead of loading the whole file up front

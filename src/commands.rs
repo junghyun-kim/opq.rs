@@ -10,10 +10,12 @@ use anyhow::{Result, anyhow};
 use arrow_schema::SchemaRef;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
-use datafusion::prelude::{ParquetReadOptions, SessionContext, ident};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, ident};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -48,6 +50,7 @@ pub async fn handle_view_command(
     format: &OutputFormat,
     truncate: usize,
     sort: &Option<Vec<String>>,
+    memory_limit: u64,
 ) -> Result<()> {
     let sort_specs = match sort {
         Some(args) if !args.is_empty() => parse_sort_specs(args)?,
@@ -62,7 +65,31 @@ pub async fn handle_view_command(
         return print_batches(reader, limit, format, truncate);
     }
 
-    handle_sorted_view(file, columns.as_deref(), limit, format, truncate, &sort_specs).await
+    handle_sorted_view(
+        file,
+        columns.as_deref(),
+        limit,
+        format,
+        truncate,
+        &sort_specs,
+        memory_limit,
+    )
+    .await
+}
+
+/// Session with a bounded memory budget. Sorts that fit stay in memory;
+/// larger ones spill to temporary disk files (external sort). 0 = unlimited.
+fn create_session_context(memory_limit: u64) -> Result<SessionContext> {
+    if memory_limit == 0 {
+        return Ok(SessionContext::new());
+    }
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit as usize)))
+        .build_arc()?;
+    Ok(SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        runtime,
+    ))
 }
 
 /// Sorted view. All file types share a single DataFusion plan:
@@ -75,8 +102,9 @@ async fn handle_sorted_view(
     format: &OutputFormat,
     truncate: usize,
     sort_specs: &[SortSpec],
+    memory_limit: u64,
 ) -> Result<()> {
-    let ctx = SessionContext::new();
+    let ctx = create_session_context(memory_limit)?;
     let file_type = get_file_type(file)?;
     let compression = detect_compression_from_extension(file);
 

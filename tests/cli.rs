@@ -19,16 +19,24 @@ use arrow_schema::{DataType, Field, Schema};
 
 const PARQUET_ROWS: i64 = 3000;
 const ORC_ROWS: i64 = 120_000;
+const BIG_SORT_ROWS: i64 = 1_000_000;
 
 fn fixture_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("opq-fixtures");
         std::fs::create_dir_all(&dir).unwrap();
-        write_parquet_fixture(&dir.join("test.parquet"));
-        write_orc_fixture(&dir.join("test.orc"));
-        gzip_file(&dir.join("test.parquet"), &dir.join("test.parquet.gz"));
-        gzip_file(&dir.join("test.orc"), &dir.join("test.orc.gz"));
+        if !dir.join("test.parquet").exists() {
+            write_parquet_fixture(&dir.join("test.parquet"));
+            gzip_file(&dir.join("test.parquet"), &dir.join("test.parquet.gz"));
+        }
+        if !dir.join("test.orc").exists() {
+            write_orc_fixture(&dir.join("test.orc"));
+            gzip_file(&dir.join("test.orc"), &dir.join("test.orc.gz"));
+        }
+        if !dir.join("big_sort.orc").exists() {
+            write_big_sort_fixture(&dir.join("big_sort.orc"));
+        }
         dir
     })
 }
@@ -89,6 +97,44 @@ fn write_orc_fixture(path: &Path) {
                 Arc::new(Int64Array::from_iter_values(start..end)) as ArrayRef,
                 Arc::new(Int64Array::from_iter_values(
                     (start..end).map(|i| m - 1 - i),
+                )),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        start = end;
+    }
+    writer.close().unwrap();
+}
+
+/// ~84MB of in-memory Arrow data (1M rows with a 60-char payload), descending
+/// `value` so a correct full sort must reorder the entire file.
+fn write_big_sort_fixture(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+
+    let file = File::create(path).unwrap();
+    let mut writer = orc_rust::arrow_writer::ArrowWriterBuilder::new(file, schema.clone())
+        .try_build()
+        .unwrap();
+
+    let n = BIG_SORT_ROWS;
+    let step = 100_000;
+    let mut start = 0;
+    while start < n {
+        let end = (start + step).min(n);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(start..end)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(
+                    (start..end).map(|i| n - 1 - i),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (start..end).map(|i| format!("{:0>60}", i)),
                 )),
             ],
         )
@@ -325,6 +371,74 @@ fn unknown_sort_column_is_a_friendly_error() {
     assert!(
         stderr.contains("nope"),
         "stderr should mention the bad column: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External (spilling) sort
+// ---------------------------------------------------------------------------
+
+#[test]
+fn full_sort_larger_than_memory_limit_spills_and_completes() {
+    // The dataset (~84MB in memory) exceeds the 64M budget, so the sort must
+    // spill to disk to finish; without spilling it would abort with a
+    // resources-exhausted error.
+    let out = opq_ok(&[
+        "view",
+        &fixture("big_sort.orc"),
+        "--sort",
+        "value",
+        "--limit",
+        "0",
+        "--memory-limit",
+        "64M",
+        "--format",
+        "ndjson",
+    ]);
+    let values = ndjson_field(&out, "value");
+    assert_eq!(values.len(), BIG_SORT_ROWS as usize);
+    assert_eq!(values[0], 0);
+    assert_eq!(*values.last().unwrap(), BIG_SORT_ROWS - 1);
+    assert!(
+        values.windows(2).all(|w| w[0] <= w[1]),
+        "output must be globally sorted"
+    );
+}
+
+#[test]
+fn sort_with_memory_limit_on_small_file_stays_in_memory() {
+    // Small sorts must still work (and stay in memory) under a budget.
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--sort",
+        "value",
+        "--limit",
+        "3",
+        "--memory-limit",
+        "64M",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "value"), vec![0, 1, 2]);
+}
+
+#[test]
+fn invalid_memory_limit_is_rejected() {
+    let out = opq(&[
+        "view",
+        &fixture("test.parquet"),
+        "--sort",
+        "value",
+        "--memory-limit",
+        "banana",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("banana"),
+        "stderr should mention the invalid value: {}",
         stderr
     );
 }
