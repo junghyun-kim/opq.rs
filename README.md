@@ -23,9 +23,14 @@ Note: Vertical format has been removed. Use table format for structured output o
 ### Commands
 - **schema** - View file schema and structure with tree visualization support
 - **metadata** - View file metadata and statistics 
-- **view** - View file contents with customizable output formats, column selection, and intelligent sorting
+- **view** - View file contents with filtering, sorting, column selection, and customizable output formats
 
 ### Advanced Features
+- **Filtering** - Filter rows with SQL expressions via `--filter`
+  - Comparisons, boolean logic, string matching: `"age > 30 AND city = 'Seoul'"`
+  - Works on any format (ORC, Parquet, compressed) and combines with sorting and column selection
+  - Filter columns don't need to be included in `--columns`
+  - On uncompressed Parquet, predicates prune row groups for fast scans
 - **Tree Schema Visualization** - Hierarchical display of complex nested structures
 - **Multiple File Support** - Process multiple files with schema and metadata commands
 - **Column Selection** - Choose specific columns for better performance and focused analysis
@@ -106,6 +111,12 @@ opq view data.parquet --columns "name" --limit 5
 
 # Select nested structures as complete objects
 opq view nested_data.parquet --columns "id,address,metadata" --limit 5
+
+# Filter rows with a SQL expression
+opq view data.parquet --filter "age > 30" --limit 10
+
+# Combine filtering, sorting, and column selection
+opq view data.parquet --columns "name,age" --filter "city = 'Seoul'" --sort "age-" --limit 10
 
 # Sort data by columns (ascending by default)
 opq view data.parquet --sort "name" --limit 10
@@ -204,6 +215,29 @@ opq view dataset.parquet --columns "name,age,salary" --sort "age-,salary:desc" -
 # 6. Export sample to JSON for further processing
 opq view dataset.parquet --columns "id,name,email" --format ndjson --limit 1000 > sample.jsonl
 ```
+
+### Filtering Examples
+
+```bash
+# Numeric comparison
+opq view employees.parquet --filter "salary >= 50000" --limit 20
+
+# String equality and boolean logic
+opq view employees.parquet --filter "department = 'Engineering' AND age < 40"
+
+# Filter on a column that is not displayed
+opq view employees.parquet --columns "name" --filter "salary > 100000"
+
+# Filter then sort: show the 10 largest recent transactions
+opq view transactions.orc --filter "amount > 0" --sort "amount:desc" --limit 10
+
+# Export all matching rows
+opq view logs.parquet.gz --filter "level = 'ERROR'" --limit 0 --format ndjson > errors.jsonl
+```
+
+Filter expressions use SQL syntax: comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`),
+boolean logic (`AND`, `OR`, `NOT`), `IN (...)`, `BETWEEN`, `LIKE`, and `IS [NOT] NULL`.
+String literals use single quotes. Column names are matched exactly (case-sensitive).
 
 ### Sorting Examples
 
@@ -357,6 +391,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Changelog
 
 ### v0.4.0 (Latest)
+- **New**: `--filter` — filter rows with SQL expressions (`--filter "age > 30 AND city = 'Seoul'"`); works on all formats, combines with sorting/column selection, and prunes Parquet row groups for fast scans
 - **Fixed**: Sorting now returns globally correct results (previously data was only sorted within each batch, and large ORC files stopped being read early)
 - **Fixed**: Sorting works on compressed files (previously failed with a file-extension error)
 - **Fixed**: `--truncate` no longer panics on multi-byte UTF-8 text (now truncates by characters)

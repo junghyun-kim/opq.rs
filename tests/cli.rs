@@ -376,6 +376,143 @@ fn unknown_sort_column_is_a_friendly_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Filtering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn filter_basic_comparison() {
+    // File order is preserved when no sort is given: matching rows are
+    // ids 2997..2999 with values 2, 1, 0.
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--filter",
+        "value < 3",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "value"), vec![2, 1, 0]);
+}
+
+#[test]
+fn filter_combines_with_sort_and_limit() {
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--filter",
+        "value < 100",
+        "--sort",
+        "value:desc",
+        "--limit",
+        "3",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "value"), vec![99, 98, 97]);
+}
+
+#[test]
+fn filter_string_equality() {
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--filter",
+        "name = '홍길동_0005'",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "id"), vec![5]);
+}
+
+#[test]
+fn filter_and_condition() {
+    // value < 10 -> ids 2990..2999; id > 2995 -> ids 2996..2999.
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--filter",
+        "value < 10 AND id > 2995",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "id"), vec![2996, 2997, 2998, 2999]);
+}
+
+#[test]
+fn filter_on_unselected_column() {
+    // Filtering by `value` while only displaying `name` must work.
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet"),
+        "--columns",
+        "name",
+        "--filter",
+        "value = 2999",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(v["name"], "홍길동_0000");
+    assert!(v.get("value").is_none(), "value column must not be in output");
+    assert_eq!(out.lines().count(), 1);
+}
+
+#[test]
+fn filter_works_on_orc() {
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.orc"),
+        "--filter",
+        "value < 2",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "value"), vec![1, 0]);
+}
+
+#[test]
+fn filter_works_on_compressed_parquet() {
+    let out = opq_ok(&[
+        "view",
+        &fixture("test.parquet.gz"),
+        "--filter",
+        "value = 0",
+        "--limit",
+        "0",
+        "--format",
+        "ndjson",
+    ]);
+    assert_eq!(ndjson_field(&out, "id"), vec![2999]);
+}
+
+#[test]
+fn invalid_filter_is_a_friendly_error() {
+    let out = opq(&[
+        "view",
+        &fixture("test.parquet"),
+        "--filter",
+        "value >>> 3",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filter"),
+        "stderr should mention the filter: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
 // External (spilling) sort
 // ---------------------------------------------------------------------------
 

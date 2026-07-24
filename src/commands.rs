@@ -50,28 +50,31 @@ pub async fn handle_view_command(
     format: &OutputFormat,
     truncate: usize,
     sort: &Option<Vec<String>>,
+    filter: &Option<String>,
     memory_limit: u64,
 ) -> Result<()> {
     let sort_specs = match sort {
         Some(args) if !args.is_empty() => parse_sort_specs(args)?,
         _ => Vec::new(),
     };
+    let filter = filter.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    if sort_specs.is_empty() {
-        // No sorting: stream batches straight from the file.
+    if sort_specs.is_empty() && filter.is_none() {
+        // No sorting or filtering: stream batches straight from the file.
         let file_type = get_file_type(file)?;
         let source = DataSource::open(file)?;
         let reader = open_batch_reader(&source, file_type, columns.as_deref())?;
         return print_batches(reader, limit, format, truncate);
     }
 
-    handle_sorted_view(
+    handle_datafusion_view(
         file,
         columns.as_deref(),
         limit,
         format,
         truncate,
         &sort_specs,
+        filter,
         memory_limit,
     )
     .await
@@ -79,32 +82,40 @@ pub async fn handle_view_command(
 
 /// Session with a bounded memory budget. Sorts that fit stay in memory;
 /// larger ones spill to temporary disk files (external sort). 0 = unlimited.
-fn create_session_context(memory_limit: u64) -> Result<SessionContext> {
+fn create_session_context(memory_limit: u64, preserve_order: bool) -> Result<SessionContext> {
+    let mut config = SessionConfig::new();
+    // Match column names in filter expressions exactly instead of
+    // lower-casing unquoted identifiers.
+    config.options_mut().sql_parser.enable_ident_normalization = false;
+    // Without an explicit sort the output should follow file order, so keep
+    // the plan on a single partition.
+    if preserve_order {
+        config = config.with_target_partitions(1);
+    }
+
     if memory_limit == 0 {
-        return Ok(SessionContext::new());
+        return Ok(SessionContext::new_with_config(config));
     }
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit as usize)))
         .build_arc()?;
-    Ok(SessionContext::new_with_config_rt(
-        SessionConfig::new(),
-        runtime,
-    ))
+    Ok(SessionContext::new_with_config_rt(config, runtime))
 }
 
-/// Sorted view. All file types share a single DataFusion plan:
-/// scan -> sort -> project -> limit. With a limit, DataFusion turns the sort
-/// into a streaming TopK that only keeps `limit` rows in memory.
-async fn handle_sorted_view(
+/// Filtered/sorted view. All file types share a single DataFusion plan:
+/// scan -> filter -> sort -> project -> limit. With a limit, DataFusion turns
+/// the sort into a streaming TopK that only keeps `limit` rows in memory.
+async fn handle_datafusion_view(
     file: &str,
     columns: Option<&[String]>,
     limit: usize,
     format: &OutputFormat,
     truncate: usize,
     sort_specs: &[SortSpec],
+    filter: Option<&str>,
     memory_limit: u64,
 ) -> Result<()> {
-    let ctx = create_session_context(memory_limit)?;
+    let ctx = create_session_context(memory_limit, sort_specs.is_empty())?;
     let file_type = get_file_type(file)?;
     let compression = detect_compression_from_extension(file);
 
@@ -117,7 +128,7 @@ async fn handle_sorted_view(
         // ORC and compressed files go through our own readers, exposed to
         // DataFusion as a streaming table.
         _ => {
-            let scan_columns = scan_columns(columns, sort_specs);
+            let scan_columns = scan_columns(columns, sort_specs, filter);
             let source = DataSource::open(file)?;
             let schema = open_batch_reader(&source, file_type, scan_columns.as_deref())?.schema();
             let scan = FileScanStream {
@@ -148,13 +159,26 @@ async fn handle_sorted_view(
         }
     }
 
-    let sort_exprs = sort_specs
-        .iter()
-        .map(|spec| ident(&spec.column).sort(spec.ascending, false)) // nulls last
-        .collect();
-    df = df.sort(sort_exprs)?;
+    // Filter first so sorting and projection only see matching rows.
+    if let Some(filter_expr) = filter {
+        let expr = df
+            .parse_sql_expr(filter_expr)
+            .map_err(|e| anyhow!("Invalid filter expression '{}': {}", filter_expr, e))?;
+        df = df
+            .filter(expr)
+            .map_err(|e| anyhow!("Invalid filter expression '{}': {}", filter_expr, e))?;
+    }
 
-    // Project after sorting, so sort columns don't have to be displayed.
+    if !sort_specs.is_empty() {
+        let sort_exprs = sort_specs
+            .iter()
+            .map(|spec| ident(&spec.column).sort(spec.ascending, false)) // nulls last
+            .collect();
+        df = df.sort(sort_exprs)?;
+    }
+
+    // Project after filtering and sorting, so filter/sort columns don't have
+    // to be displayed.
     if let Some(cols) = columns {
         df = df.select(cols.iter().map(ident).collect::<Vec<_>>())?;
     }
@@ -168,8 +192,16 @@ async fn handle_sorted_view(
 }
 
 /// Columns to read from the file: the user's selection plus any sort columns
-/// not already selected (those are dropped again after sorting).
-fn scan_columns(columns: Option<&[String]>, sort_specs: &[SortSpec]) -> Option<Vec<String>> {
+/// not already selected (those are dropped again after sorting). A filter may
+/// reference any column, so with a filter the whole file is scanned.
+fn scan_columns(
+    columns: Option<&[String]>,
+    sort_specs: &[SortSpec],
+    filter: Option<&str>,
+) -> Option<Vec<String>> {
+    if filter.is_some() {
+        return None;
+    }
     let cols = columns?;
     let mut scan = cols.to_vec();
     for spec in sort_specs {

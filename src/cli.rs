@@ -118,6 +118,9 @@ pub enum Commands {
         /// Sort columns. Format: "col1,col2-,col3:desc" (default: ascending)
         #[arg(short, long, value_delimiter = ',')]
         sort: Option<Vec<String>>,
+        /// Filter rows with a SQL expression, e.g. "age > 30 AND city = 'Seoul'"
+        #[arg(long)]
+        filter: Option<String>,
         /// Memory budget for sorting (e.g. 512M, 2G; 0 = unlimited).
         /// Sorts larger than the budget spill to temporary disk files.
         #[arg(long, default_value = "1G", value_parser = parse_memory_limit)]

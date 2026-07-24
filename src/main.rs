@@ -24,7 +24,20 @@ async fn main() -> Result<()> {
             format,
             truncate,
             sort,
+            filter,
             memory_limit,
-        } => handle_view_command(file, columns, *limit, format, *truncate, sort, *memory_limit).await,
+        } => {
+            handle_view_command(
+                file,
+                columns,
+                *limit,
+                format,
+                *truncate,
+                sort,
+                filter,
+                *memory_limit,
+            )
+            .await
+        }
     }
 }
